@@ -761,6 +761,7 @@ The webhook payload (`AlertNotificationPayload`) contains:
   "deviceName": "Temp Sensor A1",
   "metricName": "temperature",
   "triggerValue": 82.5,
+  "threshold": 80.0,
   "severity": "HIGH",
   "alertStatus": "OPEN",
   "alertOpenedAt": "2026-07-03T14:30:00",
