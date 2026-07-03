@@ -66,7 +66,6 @@ public class MetricService {
     }
 
     private void evaluateRule(AlertRule rule, Metric metric, Map<Long, Alert> openedAlerts, Device device) {
-
         var violates = evaluateCondition(metric.getValue(), rule.getOperator(), rule.getThreshold());
         var openAlert = openedAlerts.get(rule.getId());
 
