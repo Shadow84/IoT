@@ -62,12 +62,10 @@ public class MetricService {
 
         var openedAlerts = getOpenedAlerts(rules);
 
-        rules
-                .forEach(rule -> evaluateRule(rule, metric, openedAlerts, device));
+        rules.forEach(rule -> evaluateRule(rule, metric, openedAlerts, device));
     }
 
-    private void evaluateRule(AlertRule rule, Metric metric,
-                              Map<Long, Alert> openedAlerts, Device device) {
+    private void evaluateRule(AlertRule rule, Metric metric, Map<Long, Alert> openedAlerts, Device device) {
 
         var violates = evaluateCondition(metric.getValue(), rule.getOperator(), rule.getThreshold());
         var openAlert = openedAlerts.get(rule.getId());
@@ -113,13 +111,8 @@ public class MetricService {
         outboxRepository.save(outboxEvent);
 
         log.warn("ALERT OPENED: id={}, device='{}', metric='{}', value={} {} {} (severity={}).",
-                alert.getId(),
-                device.getName(),
-                metric.getMetricName(),
-                metric.getValue(),
-                rule.getOperator(),
-                rule.getThreshold(),
-                rule.getSeverity());
+                alert.getId(), device.getName(), metric.getMetricName(), metric.getValue(),
+                rule.getOperator(), rule.getThreshold(), rule.getSeverity());
     }
 
     private void closeAlert(Device device, Alert alert, AlertRule rule, Metric metric) {
@@ -131,9 +124,6 @@ public class MetricService {
         outboxRepository.save(outboxEvent);
 
         log.info("ALERT CLOSED: id={}, device='{}', metric='{}', value={} no longer violates rule.",
-                alert.getId(),
-                device.getName(),
-                metric.getMetricName(),
-                metric.getValue());
+                alert.getId(), device.getName(), metric.getMetricName(), metric.getValue());
     }
 }

@@ -30,9 +30,11 @@ public class DeviceService {
     @Transactional
     public DeviceResponse register(CreateDeviceRequest request) {
         var device = deviceMapper.toDevice(request);
+
         device.setStatus(DeviceStatus.ACTIVE);
         var saved = deviceRepository.save(device);
         log.info("Registered device id={}, name='{}'.", saved.getId(), saved.getName());
+
         return deviceMapper.toResponse(saved);
     }
 
@@ -40,6 +42,7 @@ public class DeviceService {
     public PagedResponse<DeviceResponse> listAll(Pageable pageable) {
         var page = deviceRepository.findAll(pageable)
                 .map(deviceMapper::toResponse);
+
         return PagedResponse.from(page);
     }
 
@@ -54,6 +57,7 @@ public class DeviceService {
         deviceMapper.updateDevice(request, device);
         var saved = deviceRepository.save(device);
         log.info("Updated device id={}.", saved.getId());
+
         return deviceMapper.toResponse(saved);
     }
 

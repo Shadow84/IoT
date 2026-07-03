@@ -33,9 +33,7 @@ public class OutboxScheduler {
 
         log.debug("Processing {} pending webhook outbox event(s).", pendingEvents.size());
 
-        for (var event : pendingEvents) {
-            processEvent(event);
-        }
+        pendingEvents.forEach(this::processEvent);
     }
 
     private void processEvent(OutboxEvent event) {

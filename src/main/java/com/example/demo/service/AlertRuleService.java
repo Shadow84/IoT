@@ -54,6 +54,7 @@ public class AlertRuleService {
         alertRuleMapper.updateRule(request, rule);
         var saved = alertRuleRepository.save(rule);
         log.info("Updated alert rule id={}.", saved.getId());
+
         return alertRuleMapper.toResponse(saved);
     }
 
