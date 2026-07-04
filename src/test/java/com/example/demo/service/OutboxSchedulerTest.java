@@ -229,4 +229,58 @@ class OutboxSchedulerTest {
         // Webhook was called exactly twice — once per event, never for the same event twice.
         verify(alertNotificationClient, org.mockito.Mockito.times(2)).send(any());
     }
+
+    // -----------------------------------------------------------------------
+    // Ordering — events are processed in ascending id order
+    // -----------------------------------------------------------------------
+
+    /**
+     * The repository query uses {@code ORDER BY e.id ASC}.  This test verifies
+     * that the scheduler forwards payloads to the notification client in the
+     * exact order the repository returns them (ascending id).
+     *
+     * <p>Each event is given a unique {@code deviceName} so we can assert that
+     * the first payload corresponds to the lowest id, and so on — proving the
+     * scheduler does not reorder the list it receives from the repository.
+     */
+    @Test
+    void processPendingEvents_eventsDeliveredInAscendingIdOrder() {
+        var event1 = buildPendingEvent(1L, "Device-A");
+        var event2 = buildPendingEvent(2L, "Device-B");
+        var event3 = buildPendingEvent(3L, "Device-C");
+
+        // Repository contract: returns events sorted by id ASC (ORDER BY e.id ASC).
+        when(outboxRepository.findByStatusForUpdate(PENDING))
+                .thenReturn(List.of(event1, event2, event3));
+
+        scheduler.processPendingEvents();
+
+        // Capture all three payloads in the order the client received them.
+        var captor = ArgumentCaptor.forClass(AlertNotificationPayload.class);
+        verify(alertNotificationClient, org.mockito.Mockito.times(3)).send(captor.capture());
+
+        var payloads = captor.getAllValues();
+        assertThat(payloads).hasSize(3);
+        // Payloads must arrive in id-ascending order: Device-A → Device-B → Device-C.
+        assertThat(payloads.get(0).deviceName()).isEqualTo("Device-A");
+        assertThat(payloads.get(1).deviceName()).isEqualTo("Device-B");
+        assertThat(payloads.get(2).deviceName()).isEqualTo("Device-C");
+    }
+
+    private OutboxEvent buildPendingEvent(long eventId, String deviceName) {
+        return OutboxEvent.builder()
+                .id(eventId)
+                .deviceName(deviceName)
+                .metricName("temperature")
+                .triggerValue(87.3)
+                .threshold(80.0)
+                .severity(AlertSeverity.HIGH)
+                .alertStatus(AlertStatus.OPEN)
+                .alertOpenedAt(LocalDateTime.now().minusMinutes(5))
+                .alertClosedAt(null)
+                .status(PENDING)
+                .attemptCount(0)
+                .createdAt(LocalDateTime.now().minusSeconds(30))
+                .build();
+    }
 }

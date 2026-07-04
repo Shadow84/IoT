@@ -24,9 +24,13 @@ public interface OutboxEventRepository extends JpaRepository<OutboxEvent, Long> 
      *
      * <p>Must be called inside a {@code @Transactional} method — the lock is held
      * until the surrounding transaction commits or rolls back.
+     *
+     * <p>Results are ordered by {@code id ASC} so events are always processed in
+     * strict insertion order, regardless of storage engine internals or
+     * {@code SKIP LOCKED} row skipping.
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))
-    @Query("SELECT e FROM OutboxEvent e WHERE e.status = :status")
+    @Query("SELECT e FROM OutboxEvent e WHERE e.status = :status ORDER BY e.id ASC")
     List<OutboxEvent> findByStatusForUpdate(@Param("status") OutboxStatus status);
 }
