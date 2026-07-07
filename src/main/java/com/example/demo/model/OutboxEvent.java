@@ -37,6 +37,11 @@ public class OutboxEvent {
     // ── Denormalized alert snapshot ──────────────────────────────────────────
     // All fields are captured at creation time so the scheduler never needs
     // a secondary lookup (no N+1, no FK dependency on the Alert table).
+    // deviceId is a plain copy (no FK) — together with metricName it forms
+    // the partition key for ordered multi-node outbox delivery.
+
+    @Column(nullable = false)
+    private Long deviceId;
 
     @Column(nullable = false)
     private String deviceName;

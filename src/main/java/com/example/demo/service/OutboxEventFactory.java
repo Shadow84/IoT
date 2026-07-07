@@ -14,6 +14,7 @@ public class OutboxEventFactory {
 
     public OutboxEvent buildPending(Alert alert, AlertRule rule, Device device) {
         return OutboxEvent.builder()
+                .deviceId(device.getId())
                 .deviceName(device.getName())
                 .metricName(alert.getMetricName())
                 .triggerValue(alert.getTriggerValue())

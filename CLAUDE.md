@@ -87,14 +87,14 @@ gradlew.bat bootRun --args='--spring.profiles.active=local' # Windows
     │   │   │   ├── MetricService.java                  # Ingest metric, evaluate rules, open/close alerts, write outbox (uses OutboxEventFactory)
     │   │   │   ├── AlertService.java                   # Alert queries: listAll (paged), getById — both @Transactional(readOnly=true)
     │   │   │   ├── AlertRuleService.java               # Alert rule lifecycle: create, list, get, update, enable, disable, delete
-    │   │   │   ├── OutboxScheduler.java                # @Scheduled: poll PENDING outbox events via FOR UPDATE SKIP LOCKED, deliver webhook, retry/fail
+    │                   │   │   ├── OutboxScheduler.java                # @Scheduled: partition-based ordered delivery via FOR UPDATE SKIP LOCKED; fail-fast per partition
     │   │   │   └── OutboxEventFactory.java             # @Component factory: builds OutboxEvent instances (injected into MetricService)
     │   │   ├── repository/
     │   │   │   ├── DeviceRepository.java               # JpaRepository<Device, Long>
     │   │   │   ├── MetricRepository.java               # JpaRepository<Metric, Long>
     │   │   │   ├── AlertRepository.java                # + findByRuleIdInAndStatusWithDevice (JOIN FETCH), findAllWithDeviceAndRule (paged JOIN FETCH), findByIdWithDeviceAndRule (JOIN FETCH)
     │   │   │   ├── AlertRuleRepository.java            # + findByDeviceIdAndMetricNameAndEnabledTrue
-    │   │   │   └── OutboxEventRepository.java          # + findByStatusForUpdate (@Lock PESSIMISTIC_WRITE + SKIP LOCKED)
+    │                   │   │   └── OutboxEventRepository.java          # + claimPartitionSentinels (@Lock PESSIMISTIC_WRITE + SKIP LOCKED), findAllPendingByPartition
     │   │   ├── exception/
     │   │   │   └── DeviceUnactivatedException.java     # RuntimeException → HTTP 409 Conflict (inactive device rejects metric ingestion)
     │   │   ├── model/
@@ -102,7 +102,7 @@ gradlew.bat bootRun --args='--spring.profiles.active=local' # Windows
     │   │   │   ├── Metric.java                         # @Entity: id, device, metricName, value, timestamp
     │   │   │   ├── Alert.java                          # @Entity: id, device, rule, metricName (denorm), triggerValue, severity, status, openedAt, closedAt
     │   │   │   ├── AlertRule.java                      # @Entity: id, device, metricName, operator, threshold, severity, enabled
-    │   │   │   ├── OutboxEvent.java                    # @Entity: fully denormalized alert snapshot (no FK to Alert) + OutboxStatus (PENDING/SENT/FAILED) + delivery metadata
+    │                   │   │   ├── OutboxEvent.java                    # @Entity: fully denormalized alert snapshot (no FK to Alert) + deviceId (partition key) + OutboxStatus (PENDING/SENT/FAILED) + delivery metadata
     │   │   │   ├── AlertStatus.java                    # Enum: OPEN, CLOSED
     │   │   │   ├── AlertSeverity.java                  # Enum: LOW, MEDIUM, HIGH, CRITICAL
     │   │   │   ├── AlertOperator.java                  # Enum: GREATER_THAN, LESS_THAN, EQUALS
@@ -145,7 +145,7 @@ gradlew.bat bootRun --args='--spring.profiles.active=local' # Windows
         │       ├── DeviceServiceTest.java              # Mockito unit tests: register, list (paged), get, update, deactivate, findActiveOrThrow
         │       ├── MetricServiceTest.java              # Mockito unit tests: all operators, alert lifecycle, inactive device, timestamp forwarding
         │       ├── AlertRuleServiceTest.java           # Mockito unit tests: create, list, get, update, enable, disable, delete, 404 paths
-        │       └── OutboxSchedulerTest.java            # Mockito unit tests: retry logic, max attempts, missing alert guard, cluster-safety (SKIP LOCKED)
+        │       └── OutboxSchedulerTest.java            # Mockito unit tests: retry logic, max attempts, partition ordering, fail-fast per partition, cross-partition independence, cluster-safety (SKIP LOCKED)
         └── resources/
             └── application.properties                  # Test overrides: H2 (testdb), Flyway disabled, create-drop DDL
 ```
@@ -252,7 +252,7 @@ Schema is managed by **Flyway**. Migrations live in `src/main/resources/db/migra
 
 | File | Description |
 |---|---|
-| `V1__init_schema.sql` | Creates all 5 tables: `device`, `metric`, `alert_rule`, `alert`, `outbox_event` with indexes |
+| `V1__init_schema.sql` | Creates all 5 tables: `device`, `metric`, `alert_rule`, `alert`, `outbox_event` with indexes. `outbox_event` includes `device_id` (plain `BIGINT`, no FK — partition key) and a composite index `idx_outbox_partition (device_id, metric_name, status, id)` |
 
 Flyway runs automatically on startup in the default/prod profile. It is disabled for `local` and `test` profiles — those use Hibernate `create-drop` instead.
 
@@ -276,8 +276,10 @@ When adding a new migration: create `V2__your_description.sql` in the same direc
 
 ### Webhook delivery (`OutboxScheduler`)
 - Runs every 10 seconds.
-- Polls `OutboxEvent` records with `status = PENDING` using `FOR UPDATE SKIP LOCKED` (cluster-safe).
-- Attempts `POST` to the configured webhook URL via `AlertNotificationClient`.
+- Calls `claimPartitionSentinels(PENDING)` — locks the oldest `PENDING` row per `(deviceId, metricName)` partition using `FOR UPDATE SKIP LOCKED`. Each competing scheduler node receives a disjoint set of partitions; no two nodes can process the same partition concurrently.
+- For each claimed partition, loads all `PENDING` events in `id ASC` order and delivers them sequentially.
+- **Fail-fast per partition**: if delivery of event N fails, events N+1… in the same partition are skipped for this tick — preserving ordering for the next retry.
+- A failure in one partition never blocks delivery in other partitions.
 - On success → status set to `SENT`.
 - On failure → `attemptCount` incremented. If `attemptCount < MAX_ATTEMPTS (3)` → stays `PENDING`; otherwise → status set to `FAILED`.
 

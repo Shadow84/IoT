@@ -8,6 +8,11 @@
 --     JsonAttributeConverter reads/writes plain String, so TEXT is correct).
 --   - Indexes are added on all FK columns and on outbox_event.status which
 --     is polled on every OutboxScheduler tick.
+--   - outbox_event.device_id is a plain BIGINT (no FK) — intentionally
+--     denormalized, consistent with the rest of the outbox snapshot columns.
+--     Combined with metric_name it forms the partition key used by
+--     OutboxScheduler to enforce per-(device, metric) delivery ordering
+--     across multiple concurrent scheduler nodes.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -74,6 +79,7 @@ CREATE INDEX idx_alert_status    ON alert (status);
 -- -----------------------------------------------------------------------------
 CREATE TABLE outbox_event (
     id              BIGSERIAL        PRIMARY KEY,
+    device_id       BIGINT           NOT NULL,   -- denormalized copy; no FK (intentional)
     device_name     VARCHAR(255)     NOT NULL,
     metric_name     VARCHAR(255)     NOT NULL,
     trigger_value   DOUBLE PRECISION NOT NULL,
@@ -88,5 +94,8 @@ CREATE TABLE outbox_event (
     last_attempt_at TIMESTAMP
 );
 
--- OutboxScheduler polls PENDING rows with FOR UPDATE SKIP LOCKED on every tick
-CREATE INDEX idx_outbox_event_status ON outbox_event (status);
+-- Composite index for partition-based outbox processing.
+-- OutboxScheduler uses FOR UPDATE SKIP LOCKED to claim one sentinel row per
+-- (device_id, metric_name) partition, then loads all PENDING events for that
+-- partition ordered by id ASC, guaranteeing delivery order across nodes.
+CREATE INDEX idx_outbox_partition ON outbox_event (device_id, metric_name, status, id);

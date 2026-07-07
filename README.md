@@ -33,6 +33,13 @@ A **Spring Boot 4.1.0** microservice for IoT device monitoring. It ingests devic
   - [Metric Ingestion & Alert Evaluation](#metric-ingestion--alert-evaluation)
   - [Webhook Delivery (Outbox Scheduler)](#webhook-delivery-outbox-scheduler)
 - [Architectural Patterns](#architectural-patterns)
+  - [Transactional Outbox Pattern](#transactional-outbox-pattern)
+  - [Partition-Based Ordered Outbox Delivery](#partition-based-ordered-outbox-delivery)
+  - [Denormalized Outbox Snapshot](#denormalized-outbox-snapshot)
+  - [Eager JOIN FETCH to Prevent LazyInitializationException](#eager-join-fetch-to-prevent-lazyinitializationexception)
+  - [MapStruct Partial Update Pattern](#mapstruct-partial-update-pattern)
+  - [Manual Feign Wiring (No `@FeignClient`)](#manual-feign-wiring-no-feignclient)
+  - [Lombok Entity Convention](#lombok-entity-convention)
 - [Testing](#testing)
 
 ---
@@ -94,7 +101,7 @@ HTTP Client
 OutboxScheduler ──► AlertNotificationClient (Feign) ──► External Webhook
 ```
 
-On every metric ingestion, `MetricService` evaluates all enabled `AlertRule` records for the device and metric name. When a rule threshold is crossed, an `Alert` and a corresponding `OutboxEvent` are persisted atomically. The `OutboxScheduler` polls every 10 seconds and delivers the event payload to the configured webhook URL, retrying up to 3 times before marking the event as `FAILED`.
+On every metric ingestion, `MetricService` evaluates all enabled `AlertRule` records for the device and metric name. When a rule threshold is crossed, an `Alert` and a corresponding `OutboxEvent` are persisted atomically. The `OutboxScheduler` polls every 10 seconds. Events are processed per `(deviceId, metricName)` partition — each partition is claimed by exactly one node using `FOR UPDATE SKIP LOCKED`, and events within the partition are delivered in `id ASC` order. A delivery failure stops processing for that partition (fail-fast) but never blocks other partitions. Each event is retried up to 3 times before being permanently marked `FAILED`.
 
 ---
 
@@ -127,20 +134,20 @@ On every metric ingestion, `MetricService` evaluates all enabled `AlertRule` rec
     │   │   │   ├── MetricService.java                  # Ingest metric, evaluate rules, open/close alerts, write outbox
     │   │   │   ├── AlertService.java                   # Alert queries: listAll (paged), getById — both @Transactional(readOnly=true)
     │   │   │   ├── AlertRuleService.java               # Alert rule lifecycle: create, list, get, update, enable, disable, delete
-    │   │   │   ├── OutboxScheduler.java                # @Scheduled: poll PENDING events via FOR UPDATE SKIP LOCKED, deliver webhook, retry/fail
+    │                   │   │   ├── OutboxScheduler.java                # @Scheduled: partition-based ordered delivery via FOR UPDATE SKIP LOCKED; fail-fast per partition
     │   │   │   └── OutboxEventFactory.java             # @Component factory: builds OutboxEvent instances (injected into MetricService)
     │   │   ├── repository/
     │   │   │   ├── DeviceRepository.java               # JpaRepository<Device, Long>
     │   │   │   ├── MetricRepository.java               # JpaRepository<Metric, Long>
     │   │   │   ├── AlertRepository.java                # + findByRuleIdsAndStatusOpen (JOIN FETCH), findAllPaged (JOIN FETCH), findByIdWithDeviceAndRule (JOIN FETCH)
     │   │   │   ├── AlertRuleRepository.java            # + findByDeviceIdAndMetricNameAndEnabledTrue
-    │   │   │   └── OutboxEventRepository.java          # + findByStatusForUpdate (@Lock PESSIMISTIC_WRITE + SKIP LOCKED)
+    │                   │   │   └── OutboxEventRepository.java          # + claimPartitionSentinels (@Lock PESSIMISTIC_WRITE + SKIP LOCKED), findAllPendingByPartition
     │   │   ├── model/
     │   │   │   ├── Device.java                         # @Entity: id, name, type, location, extraAttributes, status
     │   │   │   ├── Metric.java                         # @Entity: id, device, metricName, value, timestamp
     │   │   │   ├── Alert.java                          # @Entity: id, device, rule, triggerValue, severity, status, timestamps
     │   │   │   ├── AlertRule.java                      # @Entity: id, device, metricName, operator, threshold, severity, enabled
-    │   │   │   ├── OutboxEvent.java                    # @Entity: fully denormalized alert snapshot + delivery status
+    │                   │   │   ├── OutboxEvent.java                    # @Entity: fully denormalized alert snapshot + deviceId (partition key) + delivery status
     │   │   │   ├── AlertStatus.java                    # Enum: OPEN, CLOSED
     │   │   │   ├── AlertSeverity.java                  # Enum: LOW, MEDIUM, HIGH, CRITICAL
     │   │   │   ├── AlertOperator.java                  # Enum: GREATER_THAN, LESS_THAN, EQUALS
@@ -169,7 +176,7 @@ On every metric ingestion, `MetricService` evaluates all enabled `AlertRule` rec
     │       ├── application-local.properties            # Local dev overrides: H2, Flyway disabled, SQL logging
     │       └── db/
     │           └── migration/
-    │               └── V1__init_schema.sql             # Initial DDL for all 5 tables
+    │               └── V1__init_schema.sql             # Initial DDL for all 5 tables; outbox_event includes device_id (partition key) + composite index
     └── test/
         ├── java/com/example/demo/
         │   ├── DemoApplicationTests.java               # Context-load smoke test
@@ -323,7 +330,7 @@ Schema is managed by **Flyway**. Migrations live in `src/main/resources/db/migra
 
 | File | Description |
 |---|---|
-| `V1__init_schema.sql` | Creates all 5 tables: `device`, `metric`, `alert_rule`, `alert`, `outbox_event` |
+| `V1__init_schema.sql` | Creates all 5 tables: `device`, `metric`, `alert_rule`, `alert`, `outbox_event`. `outbox_event` includes `device_id` (plain `BIGINT`, no FK — partition key) and a composite index `idx_outbox_partition (device_id, metric_name, status, id)` |
 
 Flyway runs automatically on application startup (prod/Docker). It is disabled for the `local` and `test` profiles — those use Hibernate `create-drop` instead.
 
@@ -692,6 +699,7 @@ Fully denormalized — no foreign key to `Alert`. All alert data is copied at wr
 | Field | Type | Description |
 |---|---|---|
 | `id` | `Long` | Primary key |
+| `deviceId` | `Long` | Denormalized copy of `device.id` (no FK); combined with `metricName` forms the partition key for ordered multi-node delivery |
 | `deviceName` | `String` | Snapshot of device name |
 | `metricName` | `String` | Snapshot |
 | `triggerValue` | `Double` | Snapshot |
@@ -747,12 +755,16 @@ Fully denormalized — no foreign key to `Alert`. All alert data is copied at wr
 
 `OutboxScheduler.processPendingEvents()` runs every **10 seconds** in a `@Transactional` context:
 
-1. Fetch all `OutboxEvent` records with `status = PENDING`.
-2. For each event:
+1. Call `claimPartitionSentinels(PENDING)` — locks the **oldest `PENDING` row per `(deviceId, metricName)` partition** with `FOR UPDATE SKIP LOCKED`. Competing nodes skip already-locked partitions, so each partition is owned by at most one node per tick.
+2. For each claimed partition, load **all `PENDING` events** for that `(deviceId, metricName)` in `id ASC` order.
+3. Deliver events sequentially within the partition:
    - Increment `attemptCount`, set `lastAttemptAt = now()`.
    - POST `AlertNotificationPayload` (built from the event snapshot) to `alarm.webhook.url` via Feign.
-   - **Success** → set `status = SENT`.
-   - **Exception** → if `attemptCount < 3` → leave `status = PENDING` (retried next tick); if `attemptCount >= 3` → set `status = FAILED`.
+   - **Success** → set `status = SENT`, continue to the next event in the partition.
+   - **Failure** → if `attemptCount < 3` → leave `status = PENDING`; if `attemptCount >= 3` → set `status = FAILED`. Either way, **stop processing this partition** (fail-fast) — later events in the partition are not touched until the next tick.
+4. A failure in one partition never blocks delivery in other partitions — they proceed independently.
+
+This guarantees that for a given `(deviceId, metricName)` pair, an `OPEN` event is **always delivered before the corresponding `CLOSED` event**, even when multiple scheduler nodes run concurrently.
 
 The webhook payload (`AlertNotificationPayload`) contains:
 
@@ -777,6 +789,15 @@ Webhook delivery failure is **non-fatal** — alerts are persisted regardless of
 
 ### Transactional Outbox Pattern
 `OutboxEvent` records are written in the **same transaction** as the `Alert` save inside `MetricService`. The `OutboxScheduler` polls independently every 10 seconds. This guarantees that if the JVM crashes after saving the alert but before the webhook fires, the event is not lost — it stays `PENDING` and will be picked up on the next scheduler tick.
+
+### Partition-Based Ordered Outbox Delivery
+Each `(deviceId, metricName)` pair is a **partition**. Within a partition, events must be delivered in `id ASC` insertion order — ensuring that an `OPEN` notification always reaches the webhook consumer before the corresponding `CLOSED` notification.
+
+The scheduler uses a two-step strategy per tick:
+1. **Claim sentinels** (`claimPartitionSentinels`) — locks the single oldest `PENDING` row per partition with `FOR UPDATE SKIP LOCKED`. A competing node that tries to lock the same sentinel row gets nothing back for that partition — it is effectively excluded from processing it this tick.
+2. **Drain partition** (`findAllPendingByPartition`) — loads all `PENDING` events for the claimed partition in `id ASC` order and delivers them sequentially. If any event fails, the rest of the partition is skipped (fail-fast) — guaranteeing ordering is maintained for the next retry.
+
+This means multiple scheduler nodes can process **different partitions in parallel** (full horizontal scalability) while still guaranteeing **strict in-order delivery within each partition**.
 
 ### Denormalized Outbox Snapshot
 `OutboxEvent` holds no foreign key to `Alert`. All fields required for the webhook payload are copied at write time. This means the scheduler delivers each event with **zero additional DB lookups**, and the payload remains accurate even if the `Alert` record is later modified.
@@ -815,6 +836,6 @@ Tests are under `src/test/java/com/example/demo/`. The test `application.propert
 | `DeviceServiceTest` | Mockito unit test | Register, list (paged), get, update, activate, deactivate, findActiveOrThrow |
 | `AlertRuleServiceTest` | Mockito unit test | Create, list, get, update, enable, disable, delete, all 404 paths |
 | `MetricServiceTest` | Mockito unit test | All operators, alert open/close, duplicate guard, inactive device, timestamp forwarding |
-| `OutboxSchedulerTest` | Mockito unit test | Retry logic, max attempts (FAILED at 3), missing alert guard, cluster-safety (SKIP LOCKED) |
+| `OutboxSchedulerTest` | Mockito unit test | Retry logic, max attempts (FAILED at 3), cluster-safety (SKIP LOCKED), partition ordering (id ASC), fail-fast per partition, cross-partition independence |
 
 > **Boot 4.x note:** `@WebMvcTest` and `@AutoConfigureMockMvc` do not exist. Controller tests use `@SpringBootTest(webEnvironment = MOCK)` + `MockMvcBuilders.webAppContextSetup(...)`.
